@@ -1,17 +1,17 @@
 import sys
 import logging
 import traceback
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, QFrame
 from PyQt6.QtCore import Qt
 
 # Configure logging
-logging.basicConfig(filename='app_errors.log', level=logging.ERROR, 
+logging.basicConfig(filename='app_errors.log', level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 from .preview_widget import PreviewWidget
 from .sdi_capture import SDICapture
 from .ndi_output import NDIOutput
-from .ndi_input import NDIInput
+from .ndi_input import NDIInput, ndi_lib
 from .sdi_output import SDIOutput
 
 class MainWindow(QMainWindow):
@@ -25,9 +25,30 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
         
-        # Add preview widget
+        # Add dual preview widgets (left: source, right: output) with frames and labels
+        preview_layout = QHBoxLayout()
+        # Left monitor (Preview)
+        left_monitor_layout = QVBoxLayout()
+        self.source_frame = QFrame()
+        self.source_frame.setFrameShape(QFrame.Shape.Box)
+        self.source_preview = PreviewWidget()
+        source_frame_layout = QVBoxLayout(self.source_frame)
+        source_frame_layout.addWidget(self.source_preview)
+        left_monitor_layout.addWidget(self.source_frame)
+        left_monitor_layout.addWidget(QLabel("Preview", alignment=Qt.AlignmentFlag.AlignCenter))
+        # Right monitor (Converted)
+        right_monitor_layout = QVBoxLayout()
+        self.output_frame = QFrame()
+        self.output_frame.setFrameShape(QFrame.Shape.Box)
         self.preview = PreviewWidget()
-        layout.addWidget(self.preview)
+        output_frame_layout = QVBoxLayout(self.output_frame)
+        output_frame_layout.addWidget(self.preview)
+        right_monitor_layout.addWidget(self.output_frame)
+        right_monitor_layout.addWidget(QLabel("Converted", alignment=Qt.AlignmentFlag.AlignCenter))
+        # Add to main preview layout
+        preview_layout.addLayout(left_monitor_layout, 1)
+        preview_layout.addLayout(right_monitor_layout, 1)
+        layout.addLayout(preview_layout, 1)
         
         # Input/Output selection
         io_layout = QHBoxLayout()
@@ -44,6 +65,10 @@ class MainWindow(QMainWindow):
         self.ndi_source_selector = QComboBox()
         self.ndi_source_selector.hide() # Hide by default
         io_layout.addWidget(self.ndi_source_selector)
+        # Add Preview button for source preview
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.hide()
+        io_layout.addWidget(self.preview_button)
 
         # Output selection
         output_label = QLabel("Output:")
@@ -73,6 +98,7 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.start_button.clicked.connect(self.start_conversion)
         self.stop_button.clicked.connect(self.stop_conversion)
+        self.preview_button.clicked.connect(self._on_preview_clicked)
         
         # Initialize capture and output objects (will be instantiated dynamically)
         self.current_input = None
@@ -119,18 +145,86 @@ class MainWindow(QMainWindow):
     def _on_input_type_changed(self, index):
         """Handle changes in the input type selector"""
         input_type = self.input_selector.itemText(index)
+        # Stop any running source preview
+        self._stop_source_preview()
         if input_type == "NDI Input":
             self.ndi_source_selector.clear()
-            sources = NDIInput.list_sources()
-            if sources:
-                self.ndi_source_selector.addItems(sources)
+            try:
+                # Ensure NDI is initialized
+                if not ndi_lib:
+                    self.handle_error("NDI library not loaded")
+                    self.ndi_source_selector.addItem("NDI library not loaded")
+                    self.ndi_source_selector.show()
+                    self.preview_button.show()
+                    return
+
+                logging.info("Initializing NDI...")
+                if not ndi_lib.NDIlib_initialize():
+                    self.handle_error("Failed to initialize NDI")
+                    self.ndi_source_selector.addItem("NDI initialization failed")
+                    self.ndi_source_selector.show()
+                    self.preview_button.show()
+                    return
+                logging.info("NDI initialized successfully")
+
+                logging.info("Listing NDI sources...")
+                sources = NDIInput.list_sources()
+                if sources:
+                    self.ndi_source_selector.addItems(sources)
+                    self.ndi_source_selector.show()
+                    self.preview_button.show()
+                    logging.info(f"Found {len(sources)} NDI sources: {sources}")
+                else:
+                    self.ndi_source_selector.addItem("No NDI sources found")
+                    self.ndi_source_selector.show()
+                    self.preview_button.show()
+                    logging.warning("No NDI sources found.")
+            except Exception as e:
+                error_msg = f"Error listing NDI sources: {e}"
+                logging.error(error_msg)
+                self.handle_error(error_msg)
+                self.ndi_source_selector.addItem("Error listing sources")
                 self.ndi_source_selector.show()
-            else:
-                self.ndi_source_selector.addItem("No NDI sources found")
-                self.ndi_source_selector.show()
-                logging.warning("No NDI sources found.")
+                self.preview_button.show()
+            # Do not auto-start preview; wait for button click
         else:
             self.ndi_source_selector.hide()
+            self.preview_button.hide()
+            # Start SDI source preview automatically
+            self._start_source_preview("SDI Capture", None)
+
+    def _start_source_preview(self, input_type, ndi_source_name):
+        """Start a preview of the selected source in the left monitor"""
+        self._stop_source_preview()
+        logging.info(f"Starting source preview: {input_type}, {ndi_source_name}")
+        if input_type == "NDI Input" and ndi_source_name:
+            try:
+                self._source_preview_input = NDIInput(ndi_source_name=ndi_source_name)
+                self._source_preview_input.frame_ready.connect(self.source_preview.update_frame)
+                self._source_preview_input.error_occurred.connect(self.handle_error)
+                self._source_preview_input.start()
+                logging.info("NDI source preview thread started.")
+            except Exception as e:
+                self.handle_error(f"Failed to start NDI source preview: {e}")
+        elif input_type == "SDI Capture":
+            try:
+                self._source_preview_input = SDICapture()
+                self._source_preview_input.frame_ready.connect(self.source_preview.update_frame)
+                self._source_preview_input.error_occurred.connect(self.handle_error)
+                self._source_preview_input.start()
+                logging.info("SDI source preview thread started.")
+            except Exception as e:
+                self.handle_error(f"Failed to start SDI source preview: {e}")
+
+    def _stop_source_preview(self):
+        """Stop the source preview thread if running"""
+        if hasattr(self, '_source_preview_input') and self._source_preview_input:
+            try:
+                self._source_preview_input.stop()
+            except Exception:
+                pass
+            self._source_preview_input = None
+        self.source_preview.update_frame(None)
 
     def handle_error(self, error_msg):
         """Handle error messages from components"""
@@ -141,9 +235,10 @@ class MainWindow(QMainWindow):
     def start_conversion(self):
         """Start the conversion process based on selected input/output"""
         self.status_label.setText("Starting...")
-        
         # Stop any currently running conversion first
         self.stop_conversion()
+        # Stop the source preview
+        self._stop_source_preview()
 
         # Determine selected input
         input_type = self.input_selector.currentText()
@@ -213,7 +308,22 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle window close"""
         self.stop_conversion()
+        # Clean up NDI
+        if ndi_lib:
+            try:
+                ndi_lib.NDIlib_destroy()
+                logging.info("NDI library destroyed")
+            except Exception as e:
+                logging.error(f"Error destroying NDI library: {e}")
         super().closeEvent(event)
+
+    def _on_preview_clicked(self):
+        """Handle Preview button click to start NDI source preview"""
+        input_type = self.input_selector.currentText()
+        if input_type == "NDI Input":
+            selected_ndi_source = self.ndi_source_selector.currentText()
+            if selected_ndi_source and selected_ndi_source != "No NDI sources found":
+                self._start_source_preview("NDI Input", selected_ndi_source)
 
 def main():
     app = QApplication(sys.argv)
